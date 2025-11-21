@@ -1,0 +1,332 @@
+---
+title: "Hybrid memory-based user- and item-based HRS"
+author: "Hannah Marchi"
+date: ' `r format(Sys.Date(), "%d\\.%m\\.%Y")`'
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+  pdf_document:
+    toc: true
+    toc_depth: '4'
+editor_options:
+  chunk_output_type: console
+always_allow_html: true
+params: 
+  testStrategy: "classic" # classic (row-wise), RS (cell-wise)
+  patientCovars: TRUE
+  therapyChoice: "single" # single, combi
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+#load packages
+library(dplyr)
+library(rlist)
+library(caret)
+library(pROC)
+library(stringr)
+```
+
+
+```{r}
+# single/combi therapies
+if(params$therapyChoice == "single"){
+  load("HRS_data_single.Rdata")
+} else if(params$therapyChoice == "combi"){
+  load("HRS_data_combi.Rdata")
+}
+#-----
+# include/exclude patient covariates
+if(params$patientCovars == TRUE){
+  myData_04 <- myData_scale
+} else {
+  myData_04 <- myData_onlyTherapies
+}
+
+source("03_HRS_functions.R")
+```
+
+
+The following parameters are used for analysis:  
+
+* patientCovars: `r params$patientCovars`   
+* trainingTestStructure: `r params$testStrategy`  
+* therapyChoice: `r params$therapyChoice`   
+
+
+Approach: Ib   
+user: patients  
+items: therapies  
+
+```{r, fig.width = 10}
+nfold <- 10
+combis_s <- list()
+simValues <- c(1, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7) # values for patient similarity
+results_s <- matrix(nrow = length(simValues), ncol = 6)
+colnames(results_s) <- c("AUC", "Accuracy", "Sensitivity", "Specificity", "F1", "Precision")
+rownames(results_s) <- paste0("th_P0.8_T", simValues)
+bin_cutoff <- 0.5
+
+# overall validation measure over all folds
+par(mfrow = c(3,3))
+for(i in 1:length(simValues)){
+  if(params$testStrategy == "RS"){
+    combis_s[[i]] <- validate_RS(HRS = "memory2",
+                                 input_data = myData_04,
+                                 therapies = therapies,
+                                 seed = 123,
+                                 patientSim = simP,
+                                 therapySim = simT,
+                                 k = NULL,
+                                 thresholdP = 0.8,
+                                 simChoice = "threshold",
+                                 thresholdT = simValues[i],
+                                 stop_iter = NULL,
+                                 initialValues = NULL,
+                                 matrixUpdate = NULL,
+                                 fold = nfold)
+    names(combis_s)[i] <- paste0("th_P0.8_T", simValues[i])
+  } else if(params$testStrategy == "classic"){
+    combis_s[[i]] <- validate_classic(HRS = "memory2",
+                                      input_data = myData_04,
+                                      therapies = therapies,
+                                      seed = 123,
+                                      patientSim = simP,
+                                      therapySim = simT,
+                                      k = NULL,
+                                      thresholdP = 0.8,
+                                      simChoice = "threshold",
+                                      thresholdT = simValues[i],
+                                      stop_iter = NULL,
+                                      initialValues = NULL,
+                                      matrixUpdate = NULL,
+                                      fold = nfold)
+    names(combis_s)[i] <- paste0("th_P0.8_T", simValues[i])
+  }
+  
+  
+  
+  combis_s[[i]]$df_results$compare$y_true <- as.factor(combis_s[[i]]$df_results$compare$y_true)
+  myROC <- roc(response = combis_s[[i]]$df_results$compare$y_true, predictor = combis_s[[i]]$df_results$compare$y_pred)
+  plot(myROC, main = paste0("th_P0.8_T", simValues[i]))
+  combis_s[[i]]$df_results$compare$pred_bin <- ifelse(combis_s[[i]]$df_results$compare$y_pred >= bin_cutoff, 1, 0) 
+  conf <- confusionMatrix(factor(combis_s[[i]]$df_results$compare$pred_bin), factor(combis_s[[i]]$df_results$compare$y_true), positive = "1")
+  results_s[i,] <- c(round(as.numeric(myROC$auc), 3), #auc
+                     conf$overall[1], # accuracy
+                     conf$byClass[c(1,2,7,5)]) # sens, spec, F1, precision
+}
+
+# validation measures for single folds
+resultsFolds_s <- vector("list", length = length(simValues))
+for(i in 1:length(simValues)){
+  perfFolds <- matrix(nrow = nfold, ncol = 6)
+  colnames(perfFolds) <- c("AUC", "Accuracy", "Sensitivity", "Specificity", "F1", "Precision")  
+  
+  for(j in 1:nfold){
+    data_compare <- combis_s[[i]][["results"]][[j]][["compare"]]
+    
+    data_compare$y_true <- as.factor(data_compare$y_true)
+    myROC <- roc(response = data_compare$y_true, predictor = data_compare$y_pred, quiet = TRUE)
+    data_compare$pred_bin <- ifelse(data_compare$y_pred >= bin_cutoff, 1, 0) 
+    conf <- confusionMatrix(factor(data_compare$pred_bin), factor(data_compare$y_true), positive = "1")
+    perfFolds[j,] <- c(round(as.numeric(myROC$auc), 3), #auc
+                       conf$overall[1], # accuracy
+                       conf$byClass[c(1,2,7,5)]) # sens, spec, F1, prec
+  }
+  resultsFolds_s[[i]] <- perfFolds
+}
+
+
+# boxplots for AUC, Accuracy
+simValue <- rep(paste0("th_P0.8_T", simValues), each = nfold)
+test <- simValue
+test <- as.data.frame(test)
+
+AUC <- Acc <- c()
+for(i in 1:length(simValues)){
+  AUC <- c(AUC, resultsFolds_s[[i]][,"AUC"])
+  Acc <- c(Acc, resultsFolds_s[[i]][,"Accuracy"])
+}
+test$AUC <- AUC
+test$Acc <- Acc
+colnames(test) <- c("simValue", "AUC", "Accuracy")
+test$simValue <- as.factor(test$simValue)
+
+# creating a plot 
+g1 <- ggplot(test) + 
+  geom_boxplot(aes(x = simValue, y = AUC)) +
+  labs(x = "scenario", y = "AUC", title = paste0(nfold, "-fold Crossvalidation"))
+g1
+```
+
+```{r, fig.width = 10}
+g2 <- ggplot(test) + 
+  geom_boxplot(aes(x = simValue, y = Accuracy)) +
+  labs(x = "scenario", y = "Accuracy", title = paste0(nfold, "-fold Crossvalidation"))
+g2
+```
+
+```{r}
+# Summary of folds
+for(i in 1:length(simValues)){
+  print(paste0("Summary of performance for all folds for th_P0.8_T", simValues[i], ":"))
+  print(apply(resultsFolds_s[[i]], 2, summary))
+}
+
+```
+
+
+## Take k nearest neighbors
+```{r, fig.width = 10}
+combis_k <- list()
+simValues <- c(1, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7)
+results_k <- matrix(nrow = length(simValues), ncol = 6)
+colnames(results_k) <- c("AUC", "Accuracy", "Sensitivity", "Specificity", "F1", "Precision")
+rownames(results_k) <- paste0("kN100_T", simValues)
+
+# overall validation measure over all folds
+par(mfrow = c(3,3))
+for(i in 1:length(simValues)){
+  if(params$testStrategy == "RS"){
+    combis_k[[i]] <- validate_RS(HRS = "memory2",
+                                 input_data = myData_04,
+                                 therapies = therapies,
+                                 seed = 123,
+                                 patientSim = simP,
+                                 therapySim = simT,
+                                 k = 100,
+                                 thresholdP = NULL,
+                                 simChoice = "kN",
+                                 thresholdT = simValues[i],
+                                 stop_iter = NULL,
+                                 initialValues = NULL,
+                                 matrixUpdate = NULL,
+                                 fold = nfold)
+    names(combis_k)[i] <- paste0("kN100_T", simValues[i])
+  } else if(params$testStrategy == "classic"){
+    combis_k[[i]] <- validate_classic(HRS = "memory2",
+                                      input_data = myData_04,
+                                      therapies = therapies,
+                                      seed = 123,
+                                      patientSim = simP,
+                                      therapySim = simT,
+                                      k = 100,
+                                      thresholdP = NULL,
+                                      simChoice = "kN",
+                                      thresholdT = simValues[i],
+                                      stop_iter = NULL,
+                                      initialValues = NULL,
+                                      matrixUpdate = NULL,
+                                      fold = nfold)
+    names(combis_k)[i] <- paste0("kN100_T", simValues[i])
+  }
+  
+  combis_k[[i]]$df_results$compare$y_true <- as.factor(combis_k[[i]]$df_results$compare$y_true)
+  myROC <- roc(response = combis_k[[i]]$df_results$compare$y_true, predictor = combis_k[[i]]$df_results$compare$y_pred)
+  plot(myROC, main = paste0("kN100_T", simValues[i]))
+  combis_k[[i]]$df_results$compare$pred_bin <- ifelse(combis_k[[i]]$df_results$compare$y_pred >= bin_cutoff, 1, 0)
+  conf <- confusionMatrix(factor(combis_k[[i]]$df_results$compare$pred_bin), factor(combis_k[[i]]$df_results$compare$y_true), positive = "1")
+  results_k[i,] <- c(round(as.numeric(myROC$auc), 3), #auc
+                     conf$overall[1], # accuracy
+                     conf$byClass[c(1,2,7,5)]) # sens, spec, F1
+}
+
+# validation measures for single folds
+resultsFolds_k <- vector("list", length = length(simValues))
+for(i in 1:length(simValues)){
+  perfFolds <- matrix(nrow = nfold, ncol = 6)
+  colnames(perfFolds) <- c("AUC", "Accuracy", "Sensitivity", "Specificity", "F1", "Precision")
+
+  for(j in 1:nfold){
+    data_compare <- combis_k[[i]][["results"]][[j]][["compare"]]
+
+    data_compare$y_true <- as.factor(data_compare$y_true)
+    myROC <- roc(response = data_compare$y_true, predictor = data_compare$y_pred, quiet = TRUE)
+    data_compare$pred_bin <- ifelse(data_compare$y_pred >= bin_cutoff, 1, 0)
+    conf <- confusionMatrix(factor(data_compare$pred_bin), factor(data_compare$y_true), positive = "1")
+    perfFolds[j,] <- c(round(as.numeric(myROC$auc), 3), #auc
+                       conf$overall[1], # accuracy
+                       conf$byClass[c(1,2,7,5)]) # sens, spec, F1
+  }
+  resultsFolds_k[[i]] <- perfFolds
+}
+
+# boxplots for AUC, Accuracy
+simValue <- rep(paste0("kN100_T", simValues), each = nfold)
+test <- simValue
+test <- as.data.frame(test)
+
+AUC <- Acc <- c()
+for(i in 1:length(simValues)){
+  AUC <- c(AUC, resultsFolds_k[[i]][,"AUC"])
+  Acc <- c(Acc, resultsFolds_k[[i]][,"Accuracy"])
+}
+test$AUC <- AUC
+test$Acc <- Acc
+colnames(test) <- c("simValue", "AUC", "Accuracy")
+test$simValue <- as.factor(test$simValue)
+
+# creating a plot
+g1 <- ggplot(test) +
+  geom_boxplot(aes(x = simValue, y = AUC)) +
+  labs(x = "scenario", y = "AUC", title = paste0(nfold, "-fold Crossvalidation"))
+g1
+```
+
+```{r, fig.width = 10}
+g2 <- ggplot(test) +
+  geom_boxplot(aes(x = simValue, y = Accuracy)) +
+  labs(x = "scenario", y = "Accuracy", title = paste0(nfold, "-fold Crossvalidation"))
+g2
+```
+
+```{r}
+# Summary of folds
+
+for(i in 1:length(simValues)){
+  print(paste0("Summary of performance for all folds for kN100_T", simValues[i], ":"))
+  print(apply(resultsFolds_k[[i]], 2, summary))
+}
+
+```
+
+## Overall comparison
+Performance measures for all different settings: each over the test sets of all cross validation folds. 
+```{r, fig.width = 12}
+results_all_s <- as.data.frame(t(colMeans(resultsFolds_s[[1]])))
+for(i in 2:length(resultsFolds_s)){
+  results_all_s <- rbind(results_all_s, as.data.frame(t(colMeans(resultsFolds_s[[i]]))))
+}
+rownames(results_all_s) <- rownames(results_s)
+results_all_k <- as.data.frame(t(colMeans(resultsFolds_k[[1]])))
+for(i in 2:length(resultsFolds_k)){
+  results_all_k <- rbind(results_all_k, as.data.frame(t(colMeans(resultsFolds_k[[i]]))))
+}
+rownames(results_all_k) <- rownames(results_k)
+
+results_all <- rbind(results_all_k, results_all_s)
+print(paste0("Overall performance over all folds per condition with binary cutoff ", bin_cutoff, ":"))
+results_all
+
+library(xtable)
+results_print <- results_all[,c(1,3,4,6,5)]
+t_sim_names <- rep(paste0("& & $s^t = ", c(1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.7), "$"), times = 2)
+results_print <- cbind(t_sim_names, results_print)
+
+print(xtable(results_print, type = "latex", digits = 3), file = paste0("results_all_memory2_", params$testStrategy, params$therapyChoice, ".tex"), include.rownames = FALSE)
+
+```
+
+```{r}
+save.image(paste0("workspace_memoryIb_", paste0(unlist(params), collapse = "_"), ".Rdata"))
+sessionInfo()
+```
+
